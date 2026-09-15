@@ -1,14 +1,16 @@
 package scraper
 
 import (
+	"bytes"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
-	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -30,12 +32,18 @@ type ProgramData struct {
 	EndTime     string
 }
 
-// Shared HTTP client with timeouts to avoid hanging sockets
+const (
+	loginURL       = "https://account.production-public.tubi.io/user/login"
+	channelsAPIURL = "https://tensor-cdn.production-public.tubi.io/api/v2/epg"
+	epgAuthURL     = "https://epg-cdn.production-public.tubi.io/content/epg/programming"
+	epgAnonURL     = "https://tubitv.com/oz/epg/programming"
+	userAgent      = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
 var httpClient = &http.Client{
 	Timeout: 30 * time.Second,
 }
 
-// Slugs to skip to avoid empty personalization arrays
 var skipSlugs = map[string]bool{
 	"favorite_linear_channels":    true,
 	"recommended_linear_channels": true,
@@ -43,7 +51,6 @@ var skipSlugs = map[string]bool{
 	"recently_added_channels":     true,
 }
 
-// Reconciled Gracenote Station IDs
 var ManualGracenoteMap = map[string]string{
 	"618762":    "113380", // ABC News Live
 	"556174":    "114174", // NBC News NOW
@@ -69,7 +76,7 @@ var ManualGracenoteMap = map[string]string{
 	"613758":    "120375", // beIN Sports XTRA
 	"629323":    "129130", // NHRA TV
 	"400000000": "121424", // Waypoint TV
-	"613695":    "119661", // Fox Sports En Español
+	"613695":    "119661", // Fox Sports En Espa
 	"400000247": "165474", // TV One Stars & Stories
 	"692087":    "128385", // FilmRise Black TV
 	"692262":    "121534", // Maverick Black Cinema
@@ -168,123 +175,234 @@ var ManualGracenoteMap = map[string]string{
 	"555121":    "150388", // FOX LOCAL Washington DC
 }
 
-func FetchChannels() ([]ChannelData, error) {
-	log.Println("[INFO] Fetching dynamic channel list from Tubi...")
+var (
+	tokenMu     sync.Mutex
+	cachedToken string
+	tokenExpiry time.Time
+	deviceID    string
+)
 
-	// 1. Fetch HTML
-	req, _ := http.NewRequest("GET", "https://tubitv.com/live", nil)
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-	req.Header.Set("Accept", "*/*")
+func init() {
+	deviceID = generateUUID()
+}
+
+func generateUUID() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
+}
+
+func getAuthToken(username, password string) (string, error) {
+	tokenMu.Lock()
+	defer tokenMu.Unlock()
+
+	if cachedToken != "" && time.Now().Before(tokenExpiry.Add(-1*time.Minute)) {
+		return cachedToken, nil
+	}
+
+	payload := map[string]interface{}{
+		"type":      "email",
+		"platform":  "web",
+		"device_id": deviceID,
+		"credentials": map[string]string{
+			"email":    username,
+			"password": password,
+		},
+		"errorLog": false,
+	}
+
+	bodyBytes, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("failed to encode login payload: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", loginURL, bytes.NewBuffer(bodyBytes))
+	if err != nil {
+		return "", err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Origin", "https://tubitv.com")
+	req.Header.Set("Referer", "https://tubitv.com/")
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch live page: %v", err)
+		return "", fmt.Errorf("login request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	bodyBytes, _ := io.ReadAll(resp.Body)
-	html := string(bodyBytes)
-
-	// 2. Brace counting extraction
-	marker := strings.Index(html, "window.__data")
-	if marker == -1 {
-		return nil, fmt.Errorf("window.__data marker not found")
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("login rejected (status %d): %s", resp.StatusCode, string(respBody))
 	}
 
-	openBrace := strings.Index(html[marker:], "{")
-	if openBrace == -1 {
-		return nil, fmt.Errorf("opening brace not found")
+	var authResp struct {
+		AccessToken string  `json:"access_token"`
+		ExpiresIn   float64 `json:"expires_in"`
 	}
-	openBrace += marker
-
-	depth := 0
-	closeBrace := openBrace
-	for i := openBrace; i < len(html); i++ {
-		if html[i] == '{' {
-			depth++
-		} else if html[i] == '}' {
-			depth--
-			if depth == 0 {
-				closeBrace = i
-				break
-			}
-		}
+	if err := json.NewDecoder(resp.Body).Decode(&authResp); err != nil {
+		return "", fmt.Errorf("failed to decode login response: %w", err)
 	}
 
-	blob := html[openBrace : closeBrace+1]
-
-	// Clean JS constructs
-	undefRe := regexp.MustCompile(`\bundefined\b`)
-	blob = undefRe.ReplaceAllString(blob, "null")
-
-	dateRe := regexp.MustCompile(`new\s+Date\("([^"]*)"\)`)
-	blob = dateRe.ReplaceAllString(blob, `"$1"`)
-
-	// 3. Parse JSON
-	var data map[string]interface{}
-	if err := json.Unmarshal([]byte(blob), &data); err != nil {
-		return nil, fmt.Errorf("JSON decode failed: %v", err)
+	if authResp.AccessToken == "" {
+		return "", fmt.Errorf("login succeeded but no access_token was returned")
 	}
 
-	epgObj, _ := data["epg"].(map[string]interface{})
-	containers, _ := epgObj["contentIdsByContainer"].(map[string]interface{})
+	ttl := authResp.ExpiresIn
+	if ttl <= 0 {
+		ttl = 3600
+	}
 
-	var channelIDs []string
+	cachedToken = authResp.AccessToken
+	tokenExpiry = time.Now().Add(time.Duration(ttl) * time.Second)
+	log.Printf("[INFO] Authenticated as %s (token valid for %.0fs)", username, ttl)
+	return cachedToken, nil
+}
+
+// FetchChannels queries Tubi's API using account credentials
+func FetchChannels(username, password string) ([]ChannelData, error) {
+	if username == "" || password == "" {
+		return nil, fmt.Errorf("tubi credentials missing. Please set your Tubi email and password in settings")
+	}
+
+	token, err := getAuthToken(username, password)
+	if err != nil {
+		return nil, fmt.Errorf("authentication failed: %w", err)
+	}
+
+	log.Println("[INFO] Fetching linear channel list via authenticated API...")
+
+	req, err := http.NewRequest("GET", channelsAPIURL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	q := req.URL.Query()
+	q.Add("mode", "tubitv_us_linear")
+	q.Add("platform", "web")
+	q.Add("device_id", deviceID)
+	req.URL.RawQuery = q.Encode()
+
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
+	req.Header.Set("x-tubi-mode", "all")
+	req.Header.Set("x-tubi-platform", "web")
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("channels API request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("channels API responded with HTTP %d", resp.StatusCode)
+	}
+
+	var epgResponse struct {
+		Containers []struct {
+			ContainerSlug string        `json:"container_slug"`
+			Name          string        `json:"name"`
+			Contents      []interface{} `json:"contents"`
+		} `json:"containers"`
+		Contents map[string]struct {
+			NeedsLogin     bool   `json:"needs_login"`
+			Title          string `json:"title"`
+			CallSign       string `json:"call_sign"`
+			GracenoteID    string `json:"gracenote_id"`
+			VideoResources []struct {
+				Manifest struct {
+					URL string `json:"url"`
+				} `json:"manifest"`
+			} `json:"video_resources"`
+			Images struct {
+				Thumbnail []string `json:"thumbnail"`
+			} `json:"images"`
+		} `json:"contents"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&epgResponse); err != nil {
+		return nil, fmt.Errorf("failed to decode channels response: %w", err)
+	}
+
+	// Map channel IDs to groups
 	groupMapping := make(map[string]string)
-	seenIDs := make(map[string]bool)
-
-	for _, containerListObj := range containers {
-		containerList, ok := containerListObj.([]interface{})
-		if !ok {
+	for _, c := range epgResponse.Containers {
+		if skipSlugs[c.ContainerSlug] || c.Name == "" {
 			continue
 		}
-		for _, catObjInterface := range containerList {
-			cat, ok := catObjInterface.(map[string]interface{})
-			if !ok {
-				continue
+		for _, rawID := range c.Contents {
+			var idStr string
+			switch v := rawID.(type) {
+			case float64:
+				idStr = fmt.Sprintf("%.0f", v)
+			case string:
+				idStr = v
+			default:
+				idStr = fmt.Sprintf("%v", v)
 			}
-
-			slug, _ := cat["container_slug"].(string)
-			if skipSlugs[slug] {
-				continue
-			}
-
-			groupName := "Other"
-			if name, ok := cat["name"].(string); ok && name != "" {
-				groupName = name
-			}
-
-			if contents, ok := cat["contents"].([]interface{}); ok {
-				for _, idObj := range contents {
-					var idStr string
-					switch v := idObj.(type) {
-					case float64:
-						idStr = fmt.Sprintf("%.0f", v)
-					case string:
-						idStr = v
-					default:
-						idStr = fmt.Sprintf("%v", v)
-					}
-
-					if !seenIDs[idStr] {
-						seenIDs[idStr] = true
-						channelIDs = append(channelIDs, idStr)
-					}
-					if _, exists := groupMapping[idStr]; !exists {
-						groupMapping[idStr] = groupName
-					}
-				}
+			if _, exists := groupMapping[idStr]; !exists {
+				groupMapping[idStr] = c.Name
 			}
 		}
 	}
 
-	if len(channelIDs) == 0 {
-		return nil, fmt.Errorf("0 channel IDs found after parsing")
-	}
-	log.Printf("[INFO] Extracted %d dynamic channels. Fetching manifests & EPG...", len(channelIDs))
+	var channelIDs []string
+	channels := make([]ChannelData, 0, len(epgResponse.Contents))
 
-	// 4. Batch fetch metadata and programs
-	var finalChannels []ChannelData
+	for id, item := range epgResponse.Contents {
+		if item.NeedsLogin || len(item.VideoResources) == 0 {
+			continue
+		}
+
+		manifestURL := item.VideoResources[0].Manifest.URL
+		if manifestURL == "" {
+			continue
+		}
+
+		logo := ""
+		if len(item.Images.Thumbnail) > 0 {
+			logo = item.Images.Thumbnail[0]
+		}
+
+		gID := ManualGracenoteMap[id]
+		if gID == "" {
+			gID = item.GracenoteID
+		}
+
+		group := groupMapping[id]
+		if group == "" {
+			group = "Other"
+		}
+
+		channels = append(channels, ChannelData{
+			ID:          id,
+			Name:        item.Title,
+			CallSign:    item.CallSign,
+			Group:       group,
+			Logo:        logo,
+			StreamURL:   CleanStreamURL(manifestURL),
+			GracenoteID: gID,
+		})
+		channelIDs = append(channelIDs, id)
+	}
+
+	log.Printf("[INFO] Discovered %d live channels. Fetching program schedules...", len(channels))
+
+	// Fetch EPG schedule in batches
+	programsByChannel := fetchSchedules(channelIDs, token)
+	for i := range channels {
+		channels[i].Programs = programsByChannel[channels[i].ID]
+	}
+
+	return channels, nil
+}
+
+func fetchSchedules(channelIDs []string, token string) map[string][]ProgramData {
+	programsMap := make(map[string][]ProgramData)
 	batchSize := 150
 
 	for i := 0; i < len(channelIDs); i += batchSize {
@@ -293,36 +411,44 @@ func FetchChannels() ([]ChannelData, error) {
 			end = len(channelIDs)
 		}
 		batch := channelIDs[i:end]
-
 		idStr := strings.Join(batch, ",")
 
-		baseURL := "https://tubitv.com/oz/epg/programming"
-		params := url.Values{}
-		params.Add("content_id", idStr)
-
-		epgURL := fmt.Sprintf("%s?%s", baseURL, params.Encode())
-
-		epgResp, err := httpClient.Get(epgURL)
+		req, err := http.NewRequest("GET", epgAuthURL, nil)
 		if err != nil {
-			log.Printf("[WARNING] Failed to fetch batch: %v", err)
 			continue
+		}
+		q := req.URL.Query()
+		q.Add("platform", "web")
+		q.Add("device_id", deviceID)
+		q.Add("lookahead", "1")
+		q.Add("content_id", idStr)
+		req.URL.RawQuery = q.Encode()
+
+		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
+		req.Header.Set("x-tubi-mode", "all")
+		req.Header.Set("x-tubi-platform", "web")
+		req.Header.Set("User-Agent", userAgent)
+
+		resp, err := httpClient.Do(req)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			// Fall back to anonymous schedule endpoint
+			if resp != nil {
+				resp.Body.Close()
+			}
+			anonURL := fmt.Sprintf("%s?content_id=%s", epgAnonURL, url.QueryEscape(idStr))
+			resp, err = httpClient.Get(anonURL)
+			if err != nil || resp.StatusCode != http.StatusOK {
+				if resp != nil {
+					resp.Body.Close()
+				}
+				continue
+			}
 		}
 
 		var epgData struct {
 			Rows []struct {
-				ContentID      interface{} `json:"content_id"`
-				Title          string      `json:"title"`
-				CallSign       string      `json:"call_sign"`
-				GracenoteID    string      `json:"gracenote_id"`
-				VideoResources []struct {
-					Manifest struct {
-						URL string `json:"url"`
-					} `json:"manifest"`
-				} `json:"video_resources"`
-				Images struct {
-					Thumbnail []string `json:"thumbnail"`
-				} `json:"images"`
-				Programs []struct {
+				ContentID interface{} `json:"content_id"`
+				Programs  []struct {
 					Title       string `json:"title"`
 					Description string `json:"description"`
 					StartTime   string `json:"start_time"`
@@ -331,66 +457,34 @@ func FetchChannels() ([]ChannelData, error) {
 			} `json:"rows"`
 		}
 
-		if err := json.NewDecoder(epgResp.Body).Decode(&epgData); err != nil {
-			log.Printf("[WARNING] Failed to decode batch: %v", err)
-			epgResp.Body.Close()
-			continue
+		if err := json.NewDecoder(resp.Body).Decode(&epgData); err == nil {
+			for _, row := range epgData.Rows {
+				var strID string
+				switch v := row.ContentID.(type) {
+				case float64:
+					strID = fmt.Sprintf("%.0f", v)
+				case string:
+					strID = v
+				default:
+					strID = fmt.Sprintf("%v", v)
+				}
+
+				var progs []ProgramData
+				for _, p := range row.Programs {
+					progs = append(progs, ProgramData{
+						Title:       p.Title,
+						Description: p.Description,
+						StartTime:   formatTubiTime(p.StartTime),
+						EndTime:     formatTubiTime(p.EndTime),
+					})
+				}
+				programsMap[strID] = progs
+			}
 		}
-		epgResp.Body.Close()
-
-		for _, row := range epgData.Rows {
-			if len(row.VideoResources) == 0 {
-				continue
-			}
-
-			var strID string
-			switch v := row.ContentID.(type) {
-			case float64:
-				strID = fmt.Sprintf("%.0f", v)
-			case string:
-				strID = v
-			default:
-				strID = fmt.Sprintf("%v", v)
-			}
-
-			streamURL := CleanStreamURL(row.VideoResources[0].Manifest.URL)
-
-			logo := ""
-			if len(row.Images.Thumbnail) > 0 {
-				logo = row.Images.Thumbnail[0]
-			}
-
-			// Parse program guide entries for fallback / non-Gracenote mode
-			var parsedPrograms []ProgramData
-			for _, p := range row.Programs {
-				parsedPrograms = append(parsedPrograms, ProgramData{
-					Title:       p.Title,
-					Description: p.Description,
-					StartTime:   formatTubiTime(p.StartTime),
-					EndTime:     formatTubiTime(p.EndTime),
-				})
-			}
-
-			// Prioritize our map; fall back to Tubi's API Gracenote ID if present
-			gID := ManualGracenoteMap[strID]
-			if gID == "" {
-				gID = row.GracenoteID
-			}
-
-			finalChannels = append(finalChannels, ChannelData{
-				ID:          strID,
-				Name:        row.Title,
-				CallSign:    row.CallSign,
-				Group:       groupMapping[strID],
-				Logo:        logo,
-				StreamURL:   streamURL,
-				GracenoteID: gID,
-				Programs:    parsedPrograms,
-			})
-		}
+		resp.Body.Close()
 	}
 
-	return finalChannels, nil
+	return programsMap
 }
 
 func CleanStreamURL(rawURL string) string {

@@ -4,23 +4,25 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"path/filepath"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
 
-	"Tubi_Windows/scraper" // Ensure this matches your go.mod module name
+	"Tubi_Windows/scraper"
 	"golang.org/x/sys/windows/svc"
 )
 
 type Config struct {
-	Port         int  `json:"port"`
-	UseGracenote bool `json:"use_gracenote"`
+	Port         int    `json:"port"`
+	UseGracenote bool   `json:"use_gracenote"`
+	Username     string `json:"username"`
+	Password     string `json:"password"`
 }
 
 var (
@@ -44,7 +46,6 @@ func init() {
 }
 
 func main() {
-	// Detect if launched by Windows Service Manager or run manually in a console
 	isService, err := svc.IsWindowsService()
 	if err != nil {
 		log.Fatalf("Failed to determine session type: %v", err)
@@ -64,7 +65,6 @@ func runInteractive() {
 	log.Println("Starting Tubi Bridge...")
 	loadConfig()
 
-	// Start Background Scraper
 	go epgScheduler(ctx)
 
 	targetPort := appConfig.Port
@@ -105,7 +105,6 @@ func runInteractive() {
 		}
 	}()
 
-	// Wait for an OS interrupt or a shutdown command from service.go
 	stopChan := make(chan os.Signal, 1)
 	signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM)
 
@@ -124,11 +123,8 @@ func runInteractive() {
 	}
 }
 
-// --- Background Task ---
-
 func epgScheduler(ctx context.Context) {
-	refreshData() // Run immediately on startup
-
+	refreshData()
 	ticker := time.NewTicker(4 * time.Hour)
 	defer ticker.Stop()
 
@@ -143,19 +139,28 @@ func epgScheduler(ctx context.Context) {
 }
 
 func refreshData() {
+	configLock.RLock()
+	user := appConfig.Username
+	pass := appConfig.Password
+	configLock.RUnlock()
+
+	if user == "" || pass == "" {
+		log.Println("[WARNING] Tubi credentials not configured. Open the dashboard to save your login.")
+		return
+	}
+
 	log.Println("[INFO] Fetching latest Tubi channel and EPG data...")
-	data, err := scraper.FetchChannels()
+	data, err := scraper.FetchChannels(user, pass)
 	if err != nil {
 		log.Printf("[ERROR] Fetching data: %v", err)
 		return
 	}
+
 	cacheLock.Lock()
 	channelCache = data
 	cacheLock.Unlock()
 	log.Printf("[INFO] Successfully cached %d channels.", len(data))
 }
-
-// --- Dynamic Route Handlers ---
 
 func handlePlaylist(ip string, port int) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -211,9 +216,13 @@ func handleSettings(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+
 	var payload struct {
-		UseGracenote *bool `json:"use_gracenote"`
+		UseGracenote *bool   `json:"use_gracenote"`
+		Username     *string `json:"username"`
+		Password     *string `json:"password"`
 	}
+
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
@@ -223,17 +232,19 @@ func handleSettings(w http.ResponseWriter, r *http.Request) {
 	if payload.UseGracenote != nil {
 		appConfig.UseGracenote = *payload.UseGracenote
 	}
+	if payload.Username != nil {
+		appConfig.Username = *payload.Username
+	}
+	if payload.Password != nil {
+		appConfig.Password = *payload.Password
+	}
 	saveConfigLocked()
 	configLock.Unlock()
 
-	// Clear cache and force an immediate refresh to apply the new setting
 	go refreshData()
-
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(`{"status":"saved"}`))
 }
-
-// --- Configuration Helpers ---
 
 func loadConfig() {
 	configLock.Lock()
@@ -249,7 +260,6 @@ func loadConfig() {
 			log.Printf("Warning: Corrupted %s, falling back to defaults.", configFile)
 		}
 	} else {
-		// First-run: write defaults to disk
 		saveConfigLocked()
 	}
 }
@@ -269,10 +279,7 @@ func saveConfigLocked() {
 	_ = os.WriteFile(configFile, data, 0644)
 }
 
-// --- Networking & Port Discovery ---
-
 func getAvailableListener(startingPort int) (net.Listener, int, error) {
-	// 1. Try startingPort and the next 100 ports
 	for port := startingPort; port < startingPort+100; port++ {
 		addr := fmt.Sprintf("0.0.0.0:%d", port)
 		listener, err := net.Listen("tcp", addr)
@@ -281,12 +288,10 @@ func getAvailableListener(startingPort int) (net.Listener, int, error) {
 		}
 	}
 
-	// 2. Fall back to letting the OS kernel assign any free ephemeral port
 	listener, err := net.Listen("tcp", "0.0.0.0:0")
 	if err != nil {
 		return nil, 0, fmt.Errorf("no available ports found: %w", err)
 	}
-
 	assignedPort := listener.Addr().(*net.TCPAddr).Port
 	return listener, assignedPort, nil
 }
@@ -312,8 +317,6 @@ func getLocalIPAddress() string {
 	return "127.0.0.1"
 }
 
-// --- Dashboard ---
-
 func handleDashboard(ip string, port int) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
@@ -323,6 +326,8 @@ func handleDashboard(ip string, port int) http.HandlerFunc {
 
 		configLock.RLock()
 		gracenoteActive := appConfig.UseGracenote
+		user := appConfig.Username
+		pass := appConfig.Password
 		configLock.RUnlock()
 
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -339,11 +344,14 @@ func handleDashboard(ip string, port int) http.HandlerFunc {
         button { background: #238636; color: #fff; border: 0; padding: 6px 12px; border-radius: 4px; cursor: pointer; }
         button:hover { background: #2ea043; }
         .setting-box { margin-top: 20px; padding-top: 15px; border-top: 1px solid #333; }
+        .form-group { margin-bottom: 12px; }
+        .form-group label { display: block; font-size: 13px; margin-bottom: 4px; color: #bbb; }
+        .form-group input[type="text"], .form-group input[type="password"] { width: 100%%; box-sizing: border-box; padding: 8px; border-radius: 4px; border: 1px solid #444; background: #161616; color: #fff; }
     </style>
 </head>
 <body>
     <div class="card">
-        <h1>Tubi Bridge Dashboard v1.0.0</h1>
+        <h1>Tubi Bridge Dashboard v1.0.1</h1>
         <div class="link-row">
             <div>
                 <div><strong>M3U Playlist</strong></div>
@@ -359,10 +367,22 @@ func handleDashboard(ip string, port int) http.HandlerFunc {
             <button onclick="copyToClipboard('http://%s:%d/epg.xml')">Copy</button>
         </div>
         <div class="setting-box">
-            <label>
-                <input type="checkbox" id="useGracenote" %s onchange="toggleGracenote(this.checked)">
-                Use Gracenote Station IDs (Recommended for Channels DVR)
-            </label>
+            <h3>Tubi Credentials</h3>
+            <div class="form-group">
+                <label>Email</label>
+                <input type="text" id="username" value="%s" placeholder="email@example.com">
+            </div>
+            <div class="form-group">
+                <label>Password</label>
+                <input type="password" id="password" value="%s">
+            </div>
+            <div style="margin-top: 10px; margin-bottom: 15px;">
+                <label>
+                    <input type="checkbox" id="useGracenote" %s>
+                    Use Gracenote Station IDs (Channels DVR)
+                </label>
+            </div>
+            <button onclick="saveSettings()">Save & Refresh</button>
         </div>
     </div>
     <script>
@@ -377,16 +397,22 @@ func handleDashboard(ip string, port int) http.HandlerFunc {
             document.body.removeChild(textarea);
             alert('Copied to clipboard!');
         }
-        function toggleGracenote(enabled) {
+        function saveSettings() {
+            const username = document.getElementById('username').value;
+            const password = document.getElementById('password').value;
+            const useGracenote = document.getElementById('useGracenote').checked;
             fetch('/api/settings', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ use_gracenote: enabled })
-            }).then(() => location.reload());
+                body: JSON.stringify({ username: username, password: password, use_gracenote: useGracenote })
+            }).then(() => {
+                alert('Settings saved. Refresh triggered!');
+                location.reload();
+            });
         }
     </script>
 </body>
-</html>`, ip, port, ip, port, ip, port, ip, port, ip, port, ip, port, checkedAttr(gracenoteActive))
+</html>`, ip, port, ip, port, ip, port, ip, port, ip, port, ip, port, user, pass, checkedAttr(gracenoteActive))
 	}
 }
 
